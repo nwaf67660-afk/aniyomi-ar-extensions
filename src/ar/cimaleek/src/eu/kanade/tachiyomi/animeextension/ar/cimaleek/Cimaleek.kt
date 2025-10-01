@@ -17,6 +17,7 @@ import eu.kanade.tachiyomi.lib.playlistutils.PlaylistUtils
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.util.asJsoup
 import eu.kanade.tachiyomi.util.parallelCatchingFlatMapBlocking
+import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
 import okhttp3.Response
@@ -24,6 +25,7 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
+import java.io.IOException
 
 class Cimaleek : ConfigurableAnimeSource, ParsedAnimeHttpSource() {
 
@@ -39,17 +41,18 @@ class Cimaleek : ConfigurableAnimeSource, ParsedAnimeHttpSource() {
         Injekt.get<Application>().getSharedPreferences("source_$id", 0x0000)
     }
 
+    // WebView resolver لاستخراج روابط الفيديو/الترجمة من صفحات الـ embed التي تحتاج جافاسكربت
     private val webViewResolver by lazy { WebViewResolver(headers) }
 
     private val playlistUtils by lazy { PlaylistUtils(client, headers) }
 
     // ============================== Popular ===============================
     override fun popularAnimeFromElement(element: Element): SAnime {
-        return SAnime.create().apply {
-            title = element.select("div.data .title").text()
-            thumbnail_url = element.select("img").attr("data-src")
-            setUrlWithoutDomain(element.select("a").attr("href"))
-        }
+        val anime = SAnime.create()
+        anime.title = element.select("div.data .title").text()
+        anime.thumbnail_url = element.select("img").attr("data-src")
+        anime.setUrlWithoutDomain(element.select("a").attr("href"))
+        return anime
     }
 
     override fun popularAnimeNextPageSelector(): String =
@@ -69,28 +72,28 @@ class Cimaleek : ConfigurableAnimeSource, ParsedAnimeHttpSource() {
         val document = response.asJsoup()
         val url = response.request.url.toString()
         if (url.contains("movies")) {
-            episodes.add(
-                SEpisode.create().apply {
-                    name = "مشاهدة"
-                    setUrlWithoutDomain("$url/watch/")
-                },
-            )
+            val episode = SEpisode.create().apply {
+                name = "مشاهدة"
+                setUrlWithoutDomain("$url/watch/")
+            }
+            episodes.add(episode)
         } else {
             document.select(seasonListSelector()).parallelCatchingFlatMapBlocking { sElement ->
                 val seasonNum = sElement.select("span.se-a").text()
                 val seasonUrl = sElement.attr("href")
                 val seasonPage = client.newCall(GET(seasonUrl, headers)).execute().asJsoup()
                 seasonPage.select(episodeListSelector()).map { eElement ->
-                    val episodeNum = eElement.select("span.serie").text()
-                        .substringAfter("(").substringBefore(")")
+                    val episodeNum = eElement.select("span.serie").text().substringAfter("(")
+                        .substringBefore(")")
                     val episodeUrl = eElement.attr("href")
                     val finalNum = ("$seasonNum.$episodeNum").toFloat()
                     val episodeTitle = "الموسم ${seasonNum.toInt()} الحلقة ${episodeNum.toInt()}"
-                    SEpisode.create().apply {
+                    val episode = SEpisode.create().apply {
                         name = episodeTitle
                         episode_number = finalNum
                         setUrlWithoutDomain("$episodeUrl/watch/")
-                    }.also { episodes.add(it) }
+                    }
+                    episodes.add(episode)
                 }
             }
         }
@@ -103,23 +106,24 @@ class Cimaleek : ConfigurableAnimeSource, ParsedAnimeHttpSource() {
 
     // =========================== Anime Details ============================
     override fun animeDetailsParse(document: Document): SAnime {
-        return SAnime.create().apply {
-            thumbnail_url =
-                document.select("div.ani_detail-stage div.film-poster img").attr("src")
-            title =
-                document.select("div.anisc-more-info div.item:contains(الاسم) span:nth-child(3)").text()
-            author =
-                document.select("div.anisc-more-info div.item:contains(البلد) span:nth-child(3)").text()
-            genre =
-                document.select("div.anisc-detail div.item-list a").joinToString(", ") { it.text() }
-            description =
-                document.select("div.anisc-detail div.film-description div.text").text()
-            status =
-                if (document.select("div.anisc-detail div.item-list").text().contains("افلام"))
-                    SAnime.COMPLETED
-                else
-                    SAnime.UNKNOWN
+        val anime = SAnime.create()
+        anime.thumbnail_url =
+            document.select("div.ani_detail-stage div.film-poster img").attr("src")
+        anime.title =
+            document.select("div.anisc-more-info div.item:contains(الاسم) span:nth-child(3)").text()
+        anime.author =
+            document.select("div.anisc-more-info div.item:contains(البلد) span:nth-child(3)").text()
+        anime.genre =
+            document.select("div.anisc-detail div.item-list a").joinToString(", ") { it.text() }
+        anime.description = document.select("div.anisc-detail div.film-description div.text").text()
+        anime.status = if (document.select("div.anisc-detail div.item-list").text()
+                .contains("افلام")
+        ) {
+            SAnime.COMPLETED
+        } else {
+            SAnime.UNKNOWN
         }
+        return anime
     }
 
     // ============================ Video Links =============================
@@ -129,64 +133,195 @@ class Cimaleek : ConfigurableAnimeSource, ParsedAnimeHttpSource() {
 
     override fun videoListSelector(): String = "div#servers-content div.server-item div"
 
+    /**
+     * هنا قمنا بتعديل طريقة استخراج الفيديو:
+     * - نجمع عناصر السيرفرات من الصفحة.
+     * - نحاول كل سيرفر بالتتابع (لا نجمع كل السيرفرات في نفس الوقت).
+     * - عند إيجاد قائمة فيديوهات صالحة من سيرفر نرجعها فوراً.
+     * هذا يقلل احتمالية إرجاع نتائج فارغة ويضمن المرور على السيرفرات حتى نجد واحد شغال.
+     */
     override fun videoListParse(response: Response): List<Video> {
         val document = response.asJsoup()
-        val script = document.selectFirst("script:containsData(dtAjax)")!!.data()
-        val version = script.substringAfter("ver\":\"").substringBefore("\"")
+        // سكربت للحصول على نسخة الـ ver أو أي باراميتر يحتاجه طلب lalaplayer
+        val script = document.selectFirst("script:containsData(dtAjax)")?.data()
+        val version = script?.substringAfter("ver\":\"")?.substringBefore("\"") ?: ""
+        // اجمع كل عناصر السيرفر من الدوم
+        val serverElements = document.select(videoListSelector())
 
-        return document.select(videoListSelector()).parallelCatchingFlatMapBlocking {
-            extractVideos(it, version)
+        // headers مرجعي لـ embed/referrer
+        val refererHeaders = headers.newBuilder().add("Referer", "$baseUrl/").build()
+
+        // نجرب كل سيرفر بالتسلسل، نرجع أول نتيجة صالحة
+        for (element in serverElements) {
+            try {
+                val videos = tryExtractFromServer(element, version, refererHeaders)
+                if (videos.isNotEmpty()) {
+                    return videos.sortedWith(
+                        compareBy { it.quality.contains(preferredQuality()) },
+                    ).reversed()
+                }
+            } catch (e: Exception) {
+                // لو فشل السيرفر نتابع للسيرفر التالي بدل رمي الخطأ
+                logger.warn("Cimaleek", "Server extraction failed, trying next server", e)
+            }
+        }
+
+        // لو ما وجدنا شيء من أي سيرفر نرجع قائمة فارغة
+        return emptyList()
+    }
+
+    private fun preferredQuality(): String {
+        return preferences.getString("preferred_quality", "1080") ?: "1080"
+    }
+
+    /**
+     * تحاول استخراج الفيديو من عنصر سيرفر مفرد:
+     * - تبني طلب wp-json/lalaplayer/v2
+     * - تطلب الـ iframe/embed ومن ثم تمرره للـ WebViewResolver
+     * - تستخرج روابط mp4/m3u8 أو الترجمات
+     */
+    private fun tryExtractFromServer(element: Element, version: String, refererHeaders: Headers): List<Video> {
+        // بناء رابط الـ API المستخدم لطلب الـ frame (كما في الموقع)
+        val videoUrl = "$baseUrl/wp-json/lalaplayer/v2/".toHttpUrl().newBuilder().apply {
+            addQueryParameter("p", element.attr("data-post"))
+            addQueryParameter("t", element.attr("data-type"))
+            addQueryParameter("n", element.attr("data-nume"))
+            if (version.isNotBlank()) addQueryParameter("ver", version)
+            addQueryParameter("rand", generateRandomString())
+        }.build().toString()
+
+        // نحاول جلب محتوى الـ frame. بعض الأحيان الـ frame يعيد JSON أو HTML.
+        val videoFrameBody: String = try {
+            client.newCall(GET(videoUrl, refererHeaders)).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    throw IOException("Failed to fetch video frame: ${resp.code}")
+                }
+                resp.body?.string() ?: ""
+            }
+        } catch (e: Exception) {
+            throw IOException("Error requesting videoFrame: ${e.message}", e)
+        }
+
+        // نحاول استخراج embed_url من الـ response
+        val embedUrl = extractEmbedUrl(videoFrameBody) ?: videoFrameBody.trim()
+
+        if (embedUrl.isBlank()) {
+            return emptyList()
+        }
+
+        // بعض الـ embedUrl قد يكون نسقًا مشابهاً لـ /b5/... أو رابط يحول لصفحة ويب
+        val resolved = resolveEmbedUrl(embedUrl, refererHeaders)
+        if (resolved.isBlank()) return emptyList()
+
+        // إذا كان الرابط مباشرًا إلى mp4 أو m3u8 نتعامل معه مباشرة
+        if (resolved.contains(".mp4")) {
+            val v = Video(resolved, element.text(), resolved, headers = refererHeaders)
+            return listOf(v)
+        }
+
+        if (resolved.contains(".m3u8")) {
+            // نحاول استخراج قائمة اللعب من HLS
+            val subtitleList = emptyList<Track>()
+            return try {
+                playlistUtils.extractFromHls(resolved, videoNameGen = { "${element.text()}: $it" }, subtitleList = subtitleList)
+            } catch (e: Exception) {
+                emptyList()
+            }
+        }
+
+        // خلاف ذلك — قد يحتاج WebView resolution (جافاسكربت)
+        val webViewResult = webViewResolver.getUrl(resolved, refererHeaders)
+        val finalUrl = webViewResult.url
+        val subtitle = webViewResult.subtitle
+
+        if (finalUrl.isBlank()) return emptyList()
+
+        // لو وجدنا mp4
+        if (finalUrl.contains(".mp4")) {
+            val v = Video(finalUrl, element.text(), finalUrl, headers = refererHeaders)
+            return listOf(v)
+        }
+
+        // لو وجدنا m3u8
+        if (finalUrl.contains(".m3u8")) {
+            val subtitleList = if (subtitle.isNotBlank()) {
+                listOf(Track(subtitle, "Arabic"))
+            } else {
+                emptyList()
+            }
+            return try {
+                playlistUtils.extractFromHls(finalUrl, videoNameGen = { "${element.text()}: $it" }, subtitleList = subtitleList)
+            } catch (e: Exception) {
+                emptyList()
+            }
+        }
+
+        return emptyList()
+    }
+
+    // يستخرج embed_url من نص الـ response الممكن أن يكون JSON أو HTML
+    private fun extractEmbedUrl(body: String): String? {
+        // غالباً يكون embed_url في JSON على شكل "embed_url":"..."
+        val jsonCandidate = body.substringAfter("\"embed_url\":\"", missingDelimiterValue = "")
+            .substringBefore("\"", missingDelimiterValue = "")
+        if (jsonCandidate.isNotEmpty()) {
+            // قد تحتوي على escape sequences
+            return jsonCandidate.replace("\\/", "/")
+        }
+
+        // ممكن يكون في كود HTML <iframe src="...">
+        val iframeCandidate = body.substringAfter("<iframe", missingDelimiterValue = "")
+            .substringAfter("src=\"", missingDelimiterValue = "")
+            .substringBefore("\"", missingDelimiterValue = "")
+        if (iframeCandidate.isNotEmpty()) return iframeCandidate
+
+        // لا شيء
+        return null
+    }
+
+    // نحاول حل الـ embed URL — نتبع redirects إن احتاجنا، ونبسط بعض الحالات
+    private fun resolveEmbedUrl(embedUrl: String, refererHeaders: Headers): String {
+        // روابط نسبية (تبدأ بـ /) — نحولها لرابط كامل
+        val resolved = try {
+            if (embedUrl.startsWith("//")) {
+                "https:$embedUrl"
+            } else if (embedUrl.startsWith("/")) {
+                baseUrl.toHttpUrl().newBuilder().encodedPath(embedUrl).build().toString()
+            } else {
+                embedUrl
+            }
+        } catch (e: Exception) {
+            embedUrl
+        }
+
+        // نجرب عمل طلب GET ونتحقق إذا أعاد redirect نهائي
+        return try {
+            client.newCall(GET(resolved, refererHeaders)).execute().use { resp ->
+                // إذا حصل redirect (okhttp يتبع عادة) نستخدم العنوان النهائي
+                val final = resp.request.url.toString()
+                final
+            }
+        } catch (e: Exception) {
+            // لو فشل الطلب نرجع النص الأصلي ليجربه webViewResolver أو يستعمل كناتج مباشر
+            resolved
         }
     }
 
     private fun generateRandomString(): String {
         val characters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-        return (1..16).map { characters.random() }.joinToString("")
-    }
-
-    private fun extractVideos(element: Element, version: String): List<Video> {
-        val videoUrl = "$baseUrl/wp-json/lalaplayer/v2/".toHttpUrl().newBuilder()
-            .addQueryParameter("p", element.attr("data-post"))
-            .addQueryParameter("t", element.attr("data-type"))
-            .addQueryParameter("n", element.attr("data-nume"))
-            .addQueryParameter("ver", version)
-            .addQueryParameter("rand", generateRandomString())
-            .build()
-
-        val videoFrame = client.newCall(GET(videoUrl.toString(), headers)).execute().body.string()
-        val embedUrl = videoFrame.substringAfter("embed_url\":\"").substringBefore("\"")
-
-        val referer = headers.newBuilder().add("Referer", "$baseUrl/").build()
-        val webViewResult = webViewResolver.getUrl(embedUrl, referer)
-
-        return when {
-            ".mp4" in webViewResult.url -> {
-                listOf(
-                    Video(
-                        webViewResult.url,
-                        element.text(),
-                        webViewResult.url,
-                        headers = referer,
-                    ),
-                )
-            }
-            ".m3u8" in webViewResult.url -> {
-                val subtitleList = if (webViewResult.subtitle.isNotBlank()) {
-                    listOf(Track(webViewResult.subtitle, "Arabic"))
-                } else emptyList()
-                playlistUtils.extractFromHls(
-                    webViewResult.url,
-                    videoNameGen = { "${element.text()}: $it" },
-                    subtitleList = subtitleList,
-                )
-            }
-            else -> emptyList()
+        val result = StringBuilder(16)
+        for (i in 0 until 16) {
+            val randomIndex = (Math.random() * characters.length).toInt()
+            result.append(characters[randomIndex])
         }
+        return result.toString()
     }
 
     override fun List<Video>.sort(): List<Video> {
         val quality = preferences.getString("preferred_quality", "1080")!!
-        return sortedWith(compareBy { it.quality.contains(quality) }).reversed()
+        return sortedWith(
+            compareBy { it.quality.contains(quality) },
+        ).reversed()
     }
 
     // =============================== Search ===============================
@@ -199,21 +334,18 @@ class Cimaleek : ConfigurableAnimeSource, ParsedAnimeHttpSource() {
         val sectionFilter = filterList.find { it is SectionFilter } as SectionFilter
         val categoryFilter = filterList.find { it is CategoryFilter } as CategoryFilter
         val genreFilter = filterList.find { it is GenreFilter } as GenreFilter
-
         return if (query.isNotBlank()) {
             GET("$baseUrl/page/$page?s=$query", headers)
         } else {
             val url = baseUrl.toHttpUrl().newBuilder()
-            when {
-                sectionFilter.state != 0 -> {
-                    url.addPathSegment("category")
-                    url.addPathSegment(sectionFilter.toUriPart())
-                }
-                categoryFilter.state != 0 -> {
-                    url.addPathSegment("genre")
-                    url.addPathSegment(genreFilter.toUriPart().lowercase())
-                }
-                else -> throw Exception("من فضلك اختر قسم او نوع")
+            if (sectionFilter.state != 0) {
+                url.addPathSegment("category")
+                url.addPathSegment(sectionFilter.toUriPart())
+            } else if (categoryFilter.state != 0) {
+                url.addPathSegment("genre")
+                url.addPathSegment(genreFilter.toUriPart().lowercase())
+            } else {
+                throw Exception("من فضلك اختر قسم او نوع")
             }
             url.addPathSegment("page")
             url.addPathSegment("$page")
@@ -227,11 +359,12 @@ class Cimaleek : ConfigurableAnimeSource, ParsedAnimeHttpSource() {
     override fun searchAnimeSelector(): String = popularAnimeSelector()
 
     // ============================ Filters =============================
+
     override fun getFilterList() = AnimeFilterList(
-        AnimeFilter.Header("هذا القسم يعمل لو كان البحث فارغ"),
+        AnimeFilter.Header("هذا القسم يعمل لو كان البحث فارع"),
         SectionFilter(),
         AnimeFilter.Separator(),
-        AnimeFilter.Header("الفلترة تعمل فقط لو كان اقسام الموقع على 'اختر'"),
+        AnimeFilter.Header("الفلتره تعمل فقط لو كان اقسام الموقع على 'اختر'"),
         CategoryFilter(),
         GenreFilter(),
     )
@@ -294,7 +427,8 @@ class Cimaleek : ConfigurableAnimeSource, ParsedAnimeHttpSource() {
     }
 
     // =============================== Latest ===============================
-    override fun latestUpdatesFromElement(element: Element): SAnime = popularAnimeFromElement(element)
+    override fun latestUpdatesFromElement(element: Element): SAnime =
+        popularAnimeFromElement(element)
 
     override fun latestUpdatesNextPageSelector(): String = popularAnimeNextPageSelector()
 
@@ -314,7 +448,10 @@ class Cimaleek : ConfigurableAnimeSource, ParsedAnimeHttpSource() {
             summary = "%s"
 
             setOnPreferenceChangeListener { _, newValue ->
-                preferences.edit().putString(key, newValue as String).commit()
+                val selected = newValue as String
+                val index = findIndexOfValue(selected)
+                val entry = entryValues[index] as String
+                preferences.edit().putString(key, entry).commit()
             }
         }
         screen.addPreference(videoQualityPref)
