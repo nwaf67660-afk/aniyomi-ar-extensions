@@ -45,11 +45,11 @@ class Cimaleek : ConfigurableAnimeSource, ParsedAnimeHttpSource() {
 
     // ============================== Popular ===============================
     override fun popularAnimeFromElement(element: Element): SAnime {
-        val anime = SAnime.create()
-        anime.title = element.select("div.data .title").text()
-        anime.thumbnail_url = element.select("img").attr("data-src")
-        anime.setUrlWithoutDomain(element.select("a").attr("href"))
-        return anime
+        return SAnime.create().apply {
+            title = element.select("div.data .title").text()
+            thumbnail_url = element.select("img").attr("data-src")
+            setUrlWithoutDomain(element.select("a").attr("href"))
+        }
     }
 
     override fun popularAnimeNextPageSelector(): String =
@@ -69,28 +69,28 @@ class Cimaleek : ConfigurableAnimeSource, ParsedAnimeHttpSource() {
         val document = response.asJsoup()
         val url = response.request.url.toString()
         if (url.contains("movies")) {
-            val episode = SEpisode.create().apply {
-                name = "مشاهدة"
-                setUrlWithoutDomain("$url/watch/")
-            }
-            episodes.add(episode)
+            episodes.add(
+                SEpisode.create().apply {
+                    name = "مشاهدة"
+                    setUrlWithoutDomain("$url/watch/")
+                },
+            )
         } else {
             document.select(seasonListSelector()).parallelCatchingFlatMapBlocking { sElement ->
                 val seasonNum = sElement.select("span.se-a").text()
                 val seasonUrl = sElement.attr("href")
                 val seasonPage = client.newCall(GET(seasonUrl, headers)).execute().asJsoup()
                 seasonPage.select(episodeListSelector()).map { eElement ->
-                    val episodeNum = eElement.select("span.serie").text().substringAfter("(")
-                        .substringBefore(")")
+                    val episodeNum = eElement.select("span.serie").text()
+                        .substringAfter("(").substringBefore(")")
                     val episodeUrl = eElement.attr("href")
                     val finalNum = ("$seasonNum.$episodeNum").toFloat()
                     val episodeTitle = "الموسم ${seasonNum.toInt()} الحلقة ${episodeNum.toInt()}"
-                    val episode = SEpisode.create().apply {
+                    SEpisode.create().apply {
                         name = episodeTitle
                         episode_number = finalNum
                         setUrlWithoutDomain("$episodeUrl/watch/")
-                    }
-                    episodes.add(episode)
+                    }.also { episodes.add(it) }
                 }
             }
         }
@@ -103,20 +103,23 @@ class Cimaleek : ConfigurableAnimeSource, ParsedAnimeHttpSource() {
 
     // =========================== Anime Details ============================
     override fun animeDetailsParse(document: Document): SAnime {
-        val anime = SAnime.create()
-        anime.thumbnail_url =
-            document.select("div.ani_detail-stage div.film-poster img").attr("src")
-        anime.title =
-            document.select("div.anisc-more-info div.item:contains(الاسم) span:nth-child(3)").text()
-        anime.author =
-            document.select("div.anisc-more-info div.item:contains(البلد) span:nth-child(3)").text()
-        anime.genre =
-            document.select("div.anisc-detail div.item-list a").joinToString(", ") { it.text() }
-        anime.description = document.select("div.anisc-detail div.film-description div.text").text()
-        anime.status = if (document.select("div.anisc-detail div.item-list").text()
-                .contains("افلام")
-        ) { SAnime.COMPLETED } else { SAnime.UNKNOWN }
-        return anime
+        return SAnime.create().apply {
+            thumbnail_url =
+                document.select("div.ani_detail-stage div.film-poster img").attr("src")
+            title =
+                document.select("div.anisc-more-info div.item:contains(الاسم) span:nth-child(3)").text()
+            author =
+                document.select("div.anisc-more-info div.item:contains(البلد) span:nth-child(3)").text()
+            genre =
+                document.select("div.anisc-detail div.item-list a").joinToString(", ") { it.text() }
+            description =
+                document.select("div.anisc-detail div.film-description div.text").text()
+            status =
+                if (document.select("div.anisc-detail div.item-list").text().contains("افلام"))
+                    SAnime.COMPLETED
+                else
+                    SAnime.UNKNOWN
+        }
     }
 
     // ============================ Video Links =============================
@@ -130,6 +133,7 @@ class Cimaleek : ConfigurableAnimeSource, ParsedAnimeHttpSource() {
         val document = response.asJsoup()
         val script = document.selectFirst("script:containsData(dtAjax)")!!.data()
         val version = script.substringAfter("ver\":\"").substringBefore("\"")
+
         return document.select(videoListSelector()).parallelCatchingFlatMapBlocking {
             extractVideos(it, version)
         }
@@ -137,36 +141,39 @@ class Cimaleek : ConfigurableAnimeSource, ParsedAnimeHttpSource() {
 
     private fun generateRandomString(): String {
         val characters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-        val result = StringBuilder(16)
-        for (i in 0 until 16) {
-            val randomIndex = (Math.random() * characters.length).toInt()
-            result.append(characters[randomIndex])
-        }
-        return result.toString()
+        return (1..16).map { characters.random() }.joinToString("")
     }
 
     private fun extractVideos(element: Element, version: String): List<Video> {
         val videoUrl = "$baseUrl/wp-json/lalaplayer/v2/".toHttpUrl().newBuilder()
-        videoUrl.addQueryParameter("p", element.attr("data-post"))
-        videoUrl.addQueryParameter("t", element.attr("data-type"))
-        videoUrl.addQueryParameter("n", element.attr("data-nume"))
-        videoUrl.addQueryParameter("ver", version)
-        videoUrl.addQueryParameter("rand", generateRandomString())
+            .addQueryParameter("p", element.attr("data-post"))
+            .addQueryParameter("t", element.attr("data-type"))
+            .addQueryParameter("n", element.attr("data-nume"))
+            .addQueryParameter("ver", version)
+            .addQueryParameter("rand", generateRandomString())
+            .build()
+
         val videoFrame = client.newCall(GET(videoUrl.toString(), headers)).execute().body.string()
         val embedUrl = videoFrame.substringAfter("embed_url\":\"").substringBefore("\"")
+
         val referer = headers.newBuilder().add("Referer", "$baseUrl/").build()
         val webViewResult = webViewResolver.getUrl(embedUrl, referer)
+
         return when {
             ".mp4" in webViewResult.url -> {
-                Video(webViewResult.url, element.text(), webViewResult.url, headers = referer).let(
-                    ::listOf,
+                listOf(
+                    Video(
+                        webViewResult.url,
+                        element.text(),
+                        webViewResult.url,
+                        headers = referer,
+                    ),
                 )
             }
-
             ".m3u8" in webViewResult.url -> {
                 val subtitleList = if (webViewResult.subtitle.isNotBlank()) {
-                    Track(webViewResult.subtitle, "Arabic").let(::listOf)
-                } else { emptyList() }
+                    listOf(Track(webViewResult.subtitle, "Arabic"))
+                } else emptyList()
                 playlistUtils.extractFromHls(
                     webViewResult.url,
                     videoNameGen = { "${element.text()}: $it" },
@@ -179,9 +186,7 @@ class Cimaleek : ConfigurableAnimeSource, ParsedAnimeHttpSource() {
 
     override fun List<Video>.sort(): List<Video> {
         val quality = preferences.getString("preferred_quality", "1080")!!
-        return sortedWith(
-            compareBy { it.quality.contains(quality) },
-        ).reversed()
+        return sortedWith(compareBy { it.quality.contains(quality) }).reversed()
     }
 
     // =============================== Search ===============================
@@ -194,18 +199,21 @@ class Cimaleek : ConfigurableAnimeSource, ParsedAnimeHttpSource() {
         val sectionFilter = filterList.find { it is SectionFilter } as SectionFilter
         val categoryFilter = filterList.find { it is CategoryFilter } as CategoryFilter
         val genreFilter = filterList.find { it is GenreFilter } as GenreFilter
+
         return if (query.isNotBlank()) {
             GET("$baseUrl/page/$page?s=$query", headers)
         } else {
             val url = baseUrl.toHttpUrl().newBuilder()
-            if (sectionFilter.state != 0) {
-                url.addPathSegment("category")
-                url.addPathSegment(sectionFilter.toUriPart())
-            } else if (categoryFilter.state != 0) {
-                url.addPathSegment("genre")
-                url.addPathSegment(genreFilter.toUriPart().lowercase())
-            } else {
-                throw Exception("من فضلك اختر قسم او نوع")
+            when {
+                sectionFilter.state != 0 -> {
+                    url.addPathSegment("category")
+                    url.addPathSegment(sectionFilter.toUriPart())
+                }
+                categoryFilter.state != 0 -> {
+                    url.addPathSegment("genre")
+                    url.addPathSegment(genreFilter.toUriPart().lowercase())
+                }
+                else -> throw Exception("من فضلك اختر قسم او نوع")
             }
             url.addPathSegment("page")
             url.addPathSegment("$page")
@@ -219,12 +227,11 @@ class Cimaleek : ConfigurableAnimeSource, ParsedAnimeHttpSource() {
     override fun searchAnimeSelector(): String = popularAnimeSelector()
 
     // ============================ Filters =============================
-
     override fun getFilterList() = AnimeFilterList(
-        AnimeFilter.Header("هذا القسم يعمل لو كان البحث فارع"),
+        AnimeFilter.Header("هذا القسم يعمل لو كان البحث فارغ"),
         SectionFilter(),
         AnimeFilter.Separator(),
-        AnimeFilter.Header("الفلتره تعمل فقط لو كان اقسام الموقع على 'اختر'"),
+        AnimeFilter.Header("الفلترة تعمل فقط لو كان اقسام الموقع على 'اختر'"),
         CategoryFilter(),
         GenreFilter(),
     )
@@ -287,8 +294,7 @@ class Cimaleek : ConfigurableAnimeSource, ParsedAnimeHttpSource() {
     }
 
     // =============================== Latest ===============================
-    override fun latestUpdatesFromElement(element: Element): SAnime =
-        popularAnimeFromElement(element)
+    override fun latestUpdatesFromElement(element: Element): SAnime = popularAnimeFromElement(element)
 
     override fun latestUpdatesNextPageSelector(): String = popularAnimeNextPageSelector()
 
@@ -308,10 +314,7 @@ class Cimaleek : ConfigurableAnimeSource, ParsedAnimeHttpSource() {
             summary = "%s"
 
             setOnPreferenceChangeListener { _, newValue ->
-                val selected = newValue as String
-                val index = findIndexOfValue(selected)
-                val entry = entryValues[index] as String
-                preferences.edit().putString(key, entry).commit()
+                preferences.edit().putString(key, newValue as String).commit()
             }
         }
         screen.addPreference(videoQualityPref)
